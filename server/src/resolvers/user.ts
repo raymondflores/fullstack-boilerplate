@@ -13,9 +13,14 @@ import { MyContext } from 'src/types'
 import { User } from '../entities/User'
 import argon2 from 'argon2'
 import { EntityManager } from '@mikro-orm/postgresql'
+import { COOKIE_NAME, FORGET_PASSWORD_PREFIX } from '../constants'
+import { sendEmail } from '../utils/sendEmail'
+import { v4 } from 'uuid'
 
 @InputType()
 class UsernamePasswordInput {
+  @Field()
+  email: string
   @Field()
   username: string
   @Field()
@@ -52,15 +57,15 @@ export class UserResolver {
 
   @Mutation(() => UserResponse)
   async register(
-    @Arg('input') { username, password }: UsernamePasswordInput,
+    @Arg('input') { username, email, password }: UsernamePasswordInput,
     @Ctx() { em, req }: MyContext
   ): Promise<UserResponse> {
-    if (username.length <= 2) {
+    if (!email.includes('@')) {
       return {
         errors: [
           {
-            field: 'username',
-            message: 'length must be greater than 2'
+            field: 'email',
+            message: 'must be a valid email'
           }
         ]
       }
@@ -90,8 +95,9 @@ export class UserResolver {
         .getKnexQuery()
         .insert({
           username,
+          email,
           password: hashedPassword,
-          create_at: new Date(),
+          created_at: new Date(),
           updated_at: new Date()
         })
         .returning('*')
@@ -109,6 +115,8 @@ export class UserResolver {
           ]
         }
       }
+
+      console.log(err)
     }
 
     req.session.userId = user.id
@@ -118,16 +126,22 @@ export class UserResolver {
 
   @Mutation(() => UserResponse)
   async login(
-    @Arg('input') { username, password }: UsernamePasswordInput,
+    @Arg('usernameOrEmail') usernameOrEmail: string,
+    @Arg('password') password: string,
     @Ctx() { em, req }: MyContext
   ): Promise<UserResponse> {
-    const user = await em.findOne(User, { username })
+    const isEmail = usernameOrEmail.includes('@')
+    const user = await em.findOne(
+      User,
+      !isEmail ? { username: usernameOrEmail } : { email: usernameOrEmail }
+    )
+
     if (!user) {
       return {
         errors: [
           {
-            field: 'username',
-            message: 'username does not exist.'
+            field: 'usernameOrEmail',
+            message: 'username or email does not exist.'
           }
         ]
       }
@@ -145,7 +159,93 @@ export class UserResolver {
       }
     }
 
-    console.log('setting userid', user.id)
+    req.session.userId = user.id
+
+    return { user }
+  }
+
+  @Mutation(() => Boolean)
+  logout(@Ctx() { req, res }: MyContext) {
+    return new Promise(resolve =>
+      req.session.destroy(err => {
+        res.clearCookie(COOKIE_NAME)
+
+        if (err) {
+          resolve(false)
+          return
+        }
+
+        resolve(true)
+      })
+    )
+  }
+
+  @Mutation(() => Boolean)
+  async forgotPassword(
+    @Arg('email') email: string,
+    @Ctx() { em, redis }: MyContext
+  ) {
+    const user = await em.findOne(User, { email })
+
+    if (!user) {
+      return true
+    }
+
+    const token = v4()
+    await redis.set(
+      `${FORGET_PASSWORD_PREFIX}${token}`,
+      user.id,
+      'ex',
+      1000 * 60 * 60 * 60 * 24 * 3 // 3 days
+    )
+    sendEmail(
+      email,
+      `<a href="http://localhost:3000/change-password/${token}">reset password</a>`
+    )
+
+    return true
+  }
+
+  @Mutation(() => UserResponse)
+  async changePassword(
+    @Arg('token') token: string,
+    @Arg('newPassword') newPassword: string,
+    @Ctx() { redis, em, req }: MyContext
+  ): Promise<UserResponse> {
+    // add validation later
+
+    const key = `${FORGET_PASSWORD_PREFIX}${token}`
+    const userId = await redis.get(key)
+
+    if (!userId) {
+      return {
+        errors: [
+          {
+            field: 'token',
+            message: 'token expired'
+          }
+        ]
+      }
+    }
+
+    const user = await em.findOne(User, { id: parseInt(userId) })
+
+    if (!user) {
+      return {
+        errors: [
+          {
+            field: 'token',
+            message: 'token expired'
+          }
+        ]
+      }
+    }
+
+    user.password = await argon2.hash(newPassword)
+    await em.persistAndFlush(user)
+
+    await redis.del(key)
+
     req.session.userId = user.id
 
     return { user }
